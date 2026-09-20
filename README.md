@@ -602,7 +602,7 @@ then by quest level, and cut at 250 rows (`truncated = 1`). Error reasons of `QU
 REPUTATION PREREQ EXCLUSIVE CHAIN CANNOT_TAKE CANNOT_ADD ALREADY_DONE ALREADY_HAS NO_BOT NO_QUEST FORBIDDEN RATE_LIMIT`.
 `QUEST_GIVE` uses the same call as the GM `.quest add` (`AddQuestAndCheckCompletion(quest, nullptr)`) after the usual
 `CanTakeQuest` / `CanAddQuest` checks and the Playerbots security level check, so nothing is given that the bot could
-not take at an NPC. With the quest-log overflow core patch (`Quests.MaxActive`) a full log is not a blocker.
+not take at an NPC. A full quest log (25 slots) is reported as `CANNOT_TAKE`.
 
 Client side (in `client/`): `MultiBotQuestMatrixFrame.lua` is the panel (`/mbq`, or the button in the MultiBot quests
 menu). `client/install_quest_matrix.py` copies it into the addon and applies the three small hooks
