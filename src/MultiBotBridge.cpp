@@ -6896,8 +6896,9 @@ void SendQuestMatrixPackets(Player* requester, ChatMsg replyType, std::string co
     std::set<uint32> questIds;
     for (QuestMatrixMember const& member : members)
     {
-        for (uint32 const questId : member.player->GetActiveQuestIds())
-            questIds.insert(questId);
+        for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+            if (uint32 const questId = member.player->GetQuestSlotQuestId(slot))
+                questIds.insert(questId);
 
         for (uint32 const questId : member.player->getRewardedQuests())
             questIds.insert(questId);
