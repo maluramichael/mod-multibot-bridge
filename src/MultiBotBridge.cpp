@@ -1106,7 +1106,8 @@ std::string BuildTalentLinkPointSummary(std::string const& link)
 
 std::string GetPremadeSpecConfigString(std::string const& key)
 {
-    return Trim(sConfigMgr->GetOption<std::string>(key, ""));
+    // showLogs = false: unset spec slots are normal (most of the 0..30 range is empty) and must not spam the console
+    return Trim(sConfigMgr->GetOption<std::string>(key, "", false));
 }
 
 std::string GetPremadeSpecLink(uint8 classId, uint32 specIndex, uint32 botLevel)
