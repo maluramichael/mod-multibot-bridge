@@ -10,6 +10,8 @@
 #include "Group.h"
 #include "GuildMgr.h"
 #include "Item.h"
+#include "MapMgr.h"
+#include "ObjectAccessor.h"
 #include "ItemPackets.h"
 #include "ItemUsageValue.h"
 #include "LootObjectStack.h"
@@ -90,6 +92,7 @@ char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
 char const* const kGroupRollCapability = "GROUP_ROLL_V1";
 char const* const kEnchantTradeCapability = "ENCHANT_TRADE_V1";
 char const* const kQuestMatrixCapability = "QUEST_MATRIX_V1";
+char const* const kQuestInfoCapability = "QUEST_INFO_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 
 enum class BridgePayloadStatus
@@ -7087,6 +7090,930 @@ void RunQuestGiveCommand(Player* requester, ChatMsg replyType, std::string const
     SendAddonPacket(requester, replyType, "QUEST_GIVE_RESULT", payload.str());
 }
 
+// ---------------------------------------------------------------------------
+// QUEST_INFO / QUEST_PROGRESS / QUEST_TURNIN  (capability QUEST_INFO_V1)
+//
+// GET QUEST_INFO~<token>~<questId>
+//   The data behind the quest popup: title, texts (details / objectives / progress / reward), where the quest is
+//   started and handed in (NPC or object, map, zone, zone percent coordinates like the world map), and for every
+//   party member the status plus objective progress.
+//   Replies: QI_HEAD, QI_TEXT*, QI_LOC*, QI_MEMBER + QI_OBJ*, QI_END.
+//
+// GET QUEST_PROGRESS~<token>
+//   Kill objectives of every open quest of every party member, so the addon can show "Kloppi: 3/8" in the tooltip of
+//   an enemy (the client only knows its own quest log).
+//   Replies: QP_BEGIN, QP_MEMBER, QP_Q*, QP_END.
+//
+// RUN QUEST_TURNIN~<bot>~<token>~<questId>
+//   Teleports the bot to the quest ender, hands the quest in through the normal quest-giver path (so NPC scripts and
+//   the reward choice run like at a real turn-in), and teleports it back to you. Asynchronous: the result comes
+//   as QUEST_TURNIN_RESULT when the bot is back.
+// ---------------------------------------------------------------------------
+
+std::size_t constexpr kQuestTextChunkBytes = 150;
+std::size_t constexpr kMaxQuestLocationsPerRole = 3;
+uint32 constexpr kTurnInTickMs = 250;
+uint32 constexpr kTurnInTeleportTimeoutMs = 25000;
+uint32 constexpr kTurnInNpcTimeoutMs = 7000;
+float constexpr kTurnInNpcSearchRange = 40.0f;
+float constexpr kTurnInArrivalDistance = 20.0f;
+std::chrono::milliseconds constexpr kQuestInfoRateWindow(400);
+std::chrono::milliseconds constexpr kQuestProgressRateWindow(1500);
+
+bool ConsumeRequestRateLimit(char const* kind, Player* requester, std::chrono::milliseconds window)
+{
+    if (!requester)
+        return false;
+
+    static std::map<std::string, std::chrono::steady_clock::time_point> lastRequests;
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = std::string(kind) + ":" + requester->GetName();
+
+    auto const existing = lastRequests.find(key);
+    if (existing != lastRequests.end() && now - existing->second < window)
+        return false;
+
+    lastRequests[key] = now;
+
+    if (lastRequests.size() > 1024)
+    {
+        for (auto it = lastRequests.begin(); it != lastRequests.end();)
+        {
+            if (it->first != key && now - it->second >= std::chrono::seconds(60))
+                it = lastRequests.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
+LocaleConstant GetRequesterDbcLocale(Player* viewer)
+{
+    return viewer && viewer->GetSession() ? viewer->GetSession()->GetSessionDbcLocale() : LOCALE_enUS;
+}
+
+std::string LocalizedQuestString(Player* viewer, std::vector<std::string> const* locales, std::string const& base)
+{
+    std::string value = base;
+    if (locales && viewer->GetSession())
+        ObjectMgr::GetLocaleString(*locales, viewer->GetSession()->GetSessionDbLocaleIndex(), value);
+
+    return value;
+}
+
+std::string GetCreatureDisplayName(Player* viewer, uint32 entry)
+{
+    CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(entry);
+    std::string name = tmpl ? tmpl->Name : std::to_string(entry);
+    if (tmpl)
+        if (CreatureLocale const* locale = sObjectMgr->GetCreatureLocale(entry))
+            name = LocalizedQuestString(viewer, &locale->Name, name);
+
+    return name;
+}
+
+std::string GetGameObjectDisplayName(Player* viewer, uint32 entry)
+{
+    GameObjectTemplate const* tmpl = sObjectMgr->GetGameObjectTemplate(entry);
+    std::string name = tmpl ? tmpl->name : std::to_string(entry);
+    if (tmpl)
+        if (GameObjectLocale const* locale = sObjectMgr->GetGameObjectLocale(entry))
+            name = LocalizedQuestString(viewer, &locale->Name, name);
+
+    return name;
+}
+
+std::string GetItemDisplayName(Player* viewer, uint32 entry)
+{
+    ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(entry);
+    std::string name = tmpl ? tmpl->Name1 : std::to_string(entry);
+    if (tmpl)
+        if (ItemLocale const* locale = sObjectMgr->GetItemLocale(entry))
+            name = LocalizedQuestString(viewer, &locale->Name, name);
+
+    return name;
+}
+
+char const* GetDbcName(char const* const* names, LocaleConstant locale)
+{
+    char const* value = names[static_cast<std::size_t>(locale)];
+    if (!value || !*value)
+        value = names[0];
+
+    return value ? value : "";
+}
+
+// Quest texts carry $-tags: $n name, $r race, $c class, $b line break, $g<male>:<female>;
+std::string ExpandQuestText(Player* viewer, std::string const& text)
+{
+    LocaleConstant const locale = GetRequesterDbcLocale(viewer);
+    bool const male = viewer->getGender() == GENDER_MALE;
+
+    std::string out;
+    out.reserve(text.size());
+
+    for (std::size_t i = 0; i < text.size(); ++i)
+    {
+        char const c = text[i];
+        if (c != '$' || i + 1 >= text.size())
+        {
+            out.push_back(c);
+            continue;
+        }
+
+        switch (text[i + 1])
+        {
+            case 'n':
+            case 'N':
+                out += viewer->GetName();
+                ++i;
+                break;
+            case 'b':
+            case 'B':
+                out.push_back('\n');
+                ++i;
+                break;
+            case 'r':
+            case 'R':
+            {
+                ChrRacesEntry const* race = sChrRacesStore.LookupEntry(viewer->getRace());
+                out += race ? GetDbcName(race->name, locale) : "adventurer";
+                ++i;
+                break;
+            }
+            case 'c':
+            case 'C':
+            {
+                ChrClassesEntry const* cls = sChrClassesStore.LookupEntry(viewer->getClass());
+                out += cls ? GetDbcName(cls->name, locale) : "adventurer";
+                ++i;
+                break;
+            }
+            case 'g':
+            case 'G':
+            {
+                std::size_t const colon = text.find(':', i + 2);
+                std::size_t const semi = text.find(';', i + 2);
+                if (colon == std::string::npos || semi == std::string::npos || colon > semi)
+                {
+                    out.push_back(c);
+                    break;
+                }
+
+                std::string const maleText = text.substr(i + 2, colon - (i + 2));
+                std::string const femaleText = text.substr(colon + 1, semi - colon - 1);
+                out += male ? maleText : femaleText;
+                i = semi;
+                break;
+            }
+            default:
+                out.push_back(c);
+                break;
+        }
+    }
+
+    return out;
+}
+
+// Splits a text into packets of at most kQuestTextChunkBytes encoded bytes, never inside a UTF-8 character.
+void SendQuestTextPackets(Player* requester, ChatMsg replyType, std::string const& token, char kind, std::string const& text)
+{
+    if (text.empty())
+        return;
+
+    std::vector<std::string> chunks;
+    std::string current;
+    std::size_t currentEncoded = 0;
+
+    for (std::size_t i = 0; i < text.size();)
+    {
+        unsigned char const lead = static_cast<unsigned char>(text[i]);
+        std::size_t length = 1;
+        if (lead >= 0xF0)
+            length = 4;
+        else if (lead >= 0xE0)
+            length = 3;
+        else if (lead >= 0xC0)
+            length = 2;
+
+        length = std::min(length, text.size() - i);
+        std::string const character = text.substr(i, length);
+        std::size_t const encoded = UrlEncodeField(character).size();
+
+        if (!current.empty() && currentEncoded + encoded > kQuestTextChunkBytes)
+        {
+            chunks.push_back(current);
+            current.clear();
+            currentEncoded = 0;
+        }
+
+        current += character;
+        currentEncoded += encoded;
+        i += length;
+    }
+
+    if (!current.empty())
+        chunks.push_back(current);
+
+    for (std::size_t index = 0; index < chunks.size(); ++index)
+    {
+        std::ostringstream payload;
+        payload << token
+            << kFieldSeparator << kind
+            << kFieldSeparator << index
+            << kFieldSeparator << chunks.size()
+            << kFieldSeparator << UrlEncodeField(chunks[index]);
+        SendAddonPacket(requester, replyType, "QI_TEXT", payload.str());
+    }
+}
+
+struct QuestLocation
+{
+    char role = 'S'; // S starts the quest, E hands it in
+    char kind = 'C'; // C creature, G game object
+    uint32 entry = 0;
+    std::string name;
+    uint32 map = 0;
+    uint32 zone = 0;
+    std::string mapName;
+    std::string zoneName;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float pctX = -1.0f;
+    float pctY = -1.0f;
+    bool sameMap = false;
+    float dist = 0.0f;
+};
+
+void ResolveQuestLocationZone(Player* viewer, QuestLocation& location)
+{
+    LocaleConstant const locale = GetRequesterDbcLocale(viewer);
+
+    MapEntry const* mapEntry = sMapStore.LookupEntry(location.map);
+    if (!mapEntry)
+        return;
+
+    location.mapName = GetDbcName(mapEntry->name, locale);
+
+    // Zone + world-map percent coordinates only make sense on the open continents.
+    if (!mapEntry->IsContinent())
+        return;
+
+    location.zone = sMapMgr->GetZoneId(PHASEMASK_NORMAL, location.map, location.x, location.y, location.z);
+    if (!location.zone)
+        return;
+
+    if (AreaTableEntry const* area = sAreaTableStore.LookupEntry(location.zone))
+        location.zoneName = GetDbcName(area->area_name, locale);
+
+    float pctX = location.x;
+    float pctY = location.y;
+    Map2ZoneCoordinates(pctX, pctY, location.zone);
+    if (pctX >= 0.0f && pctX <= 100.0f && pctY >= 0.0f && pctY <= 100.0f)
+    {
+        location.pctX = pctX;
+        location.pctY = pctY;
+    }
+}
+
+// The closest spawn of one quest giver / quest ender entry, or nothing when it has no spawn.
+bool FindBestSpawn(Player* viewer, char role, char kind, uint32 entry, QuestLocation& out)
+{
+    QueryResult result = kind == 'C'
+        ? WorldDatabase.Query("SELECT `map`, `position_x`, `position_y`, `position_z` FROM `creature` WHERE `id` = {} LIMIT 60", entry)
+        : WorldDatabase.Query("SELECT `map`, `position_x`, `position_y`, `position_z` FROM `gameobject` WHERE `id` = {} LIMIT 60", entry);
+    if (!result)
+        return false;
+
+    bool found = false;
+    do
+    {
+        Field* const fields = result->Fetch();
+        uint32 const map = fields[0].Get<uint32>();
+        float const x = fields[1].Get<float>();
+        float const y = fields[2].Get<float>();
+        float const z = fields[3].Get<float>();
+
+        bool const sameMap = viewer->GetMapId() == map;
+        float const dist = sameMap ? viewer->GetExactDist(x, y, z) : 1.0e9f;
+
+        // prefer a spawn on the viewer's map, and among those the nearest
+        if (found && (out.sameMap || !sameMap) && !(sameMap && dist < out.dist))
+            continue;
+
+        out.role = role;
+        out.kind = kind;
+        out.entry = entry;
+        out.map = map;
+        out.x = x;
+        out.y = y;
+        out.z = z;
+        out.sameMap = sameMap;
+        out.dist = dist;
+        found = true;
+    }
+    while (result->NextRow());
+
+    if (!found)
+        return false;
+
+    out.name = kind == 'C' ? GetCreatureDisplayName(viewer, entry) : GetGameObjectDisplayName(viewer, entry);
+    ResolveQuestLocationZone(viewer, out);
+    return true;
+}
+
+std::vector<uint32> QueryQuestRelationEntries(char const* table, uint32 questId)
+{
+    std::vector<uint32> entries;
+    QueryResult result = WorldDatabase.Query("SELECT `id` FROM `{}` WHERE `quest` = {} LIMIT 8", table, questId);
+    if (!result)
+        return entries;
+
+    do
+    {
+        entries.push_back(result->Fetch()[0].Get<uint32>());
+    }
+    while (result->NextRow());
+
+    return entries;
+}
+
+std::vector<QuestLocation> FindQuestLocations(Player* viewer, uint32 questId, char role)
+{
+    std::vector<QuestLocation> locations;
+    bool const ender = role == 'E';
+
+    for (uint32 const entry : QueryQuestRelationEntries(ender ? "creature_questender" : "creature_queststarter", questId))
+    {
+        QuestLocation location;
+        if (FindBestSpawn(viewer, role, 'C', entry, location))
+            locations.push_back(std::move(location));
+    }
+
+    for (uint32 const entry : QueryQuestRelationEntries(ender ? "gameobject_questender" : "gameobject_queststarter", questId))
+    {
+        QuestLocation location;
+        if (FindBestSpawn(viewer, role, 'G', entry, location))
+            locations.push_back(std::move(location));
+    }
+
+    std::sort(locations.begin(), locations.end(), [](QuestLocation const& left, QuestLocation const& right)
+    {
+        if (left.sameMap != right.sameMap)
+            return left.sameMap;
+        return left.dist < right.dist;
+    });
+
+    if (locations.size() > kMaxQuestLocationsPerRole)
+        locations.resize(kMaxQuestLocationsPerRole);
+
+    return locations;
+}
+
+struct QuestObjectiveLine
+{
+    char type = 'K'; // K kill, G use/interact with an object, I collect an item
+    uint32 entry = 0;
+    uint32 have = 0;
+    uint32 need = 0;
+    std::string name;
+};
+
+std::vector<QuestObjectiveLine> BuildQuestObjectives(Player* viewer, Player* member, Quest const* quest, bool withNames)
+{
+    std::vector<QuestObjectiveLine> lines;
+
+    QuestStatusMap& statusMap = member->getQuestStatusMap();
+    auto const status = statusMap.find(quest->GetQuestId());
+    QuestStatusData const* data = status != statusMap.end() ? &status->second : nullptr;
+
+    for (uint32 i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
+    {
+        int32 const required = quest->RequiredNpcOrGo[i];
+        uint32 const need = quest->RequiredNpcOrGoCount[i];
+        if (!required || !need)
+            continue;
+
+        QuestObjectiveLine line;
+        line.type = required > 0 ? 'K' : 'G';
+        line.entry = static_cast<uint32>(required > 0 ? required : -required);
+        line.need = need;
+        line.have = data ? std::min<uint32>(data->CreatureOrGOCount[i], need) : 0;
+        if (withNames)
+            line.name = required > 0 ? GetCreatureDisplayName(viewer, line.entry) : GetGameObjectDisplayName(viewer, line.entry);
+
+        lines.push_back(std::move(line));
+    }
+
+    for (uint32 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+    {
+        uint32 const itemId = quest->RequiredItemId[i];
+        uint32 const need = quest->RequiredItemCount[i];
+        if (!itemId || !need)
+            continue;
+
+        QuestObjectiveLine line;
+        line.type = 'I';
+        line.entry = itemId;
+        line.need = need;
+        line.have = std::min<uint32>(member->GetItemCount(itemId, true), need);
+        if (withNames)
+            line.name = GetItemDisplayName(viewer, itemId);
+
+        lines.push_back(std::move(line));
+    }
+
+    return lines;
+}
+
+// Shortens the trailing free-text field until the whole packet fits the wire budget.
+void SendFittedAddonPacket(Player* requester, ChatMsg replyType, std::string const& opcode, std::string const& head, std::string text)
+{
+    while (!text.empty() && !IsAddonPacketWithinBudget(opcode, head + UrlEncodeField(text)))
+        PopLastUtf8Char(text);
+
+    SendAddonPacket(requester, replyType, opcode, head + UrlEncodeField(text));
+}
+
+void SendQuestInfoPackets(Player* requester, ChatMsg replyType, std::string const& token, uint32 questId)
+{
+    Quest const* const quest = sObjectMgr->GetQuestTemplate(questId);
+    if (!quest)
+    {
+        SendProtocolError(requester, replyType, "GET", "QUEST_INFO", token, "NO_QUEST");
+        return;
+    }
+
+    QuestLocale const* const locale = sObjectMgr->GetQuestLocale(questId);
+    int32 const questLevel = quest->GetQuestLevel();
+
+    std::ostringstream head;
+    head << token
+        << kFieldSeparator << questId
+        << kFieldSeparator << (questLevel > 0 ? questLevel : static_cast<int32>(requester->GetLevel()))
+        << kFieldSeparator << quest->GetMinLevel()
+        << kFieldSeparator;
+    SendFittedAddonPacket(requester, replyType, "QI_HEAD", head.str(), GetQuestMatrixTitle(requester, quest));
+
+    SendQuestTextPackets(requester, replyType, token, 'D', ExpandQuestText(requester,
+        LocalizedQuestString(requester, locale ? &locale->Details : nullptr, quest->GetDetails())));
+    SendQuestTextPackets(requester, replyType, token, 'O', ExpandQuestText(requester,
+        LocalizedQuestString(requester, locale ? &locale->Objectives : nullptr, quest->GetObjectives())));
+    SendQuestTextPackets(requester, replyType, token, 'P', ExpandQuestText(requester,
+        LocalizedQuestString(requester, locale ? &locale->RequestItemsText : nullptr, quest->GetRequestItemsText())));
+    SendQuestTextPackets(requester, replyType, token, 'R', ExpandQuestText(requester,
+        LocalizedQuestString(requester, locale ? &locale->OfferRewardText : nullptr, quest->GetOfferRewardText())));
+
+    for (char const role : { 'S', 'E' })
+    {
+        for (QuestLocation const& location : FindQuestLocations(requester, questId, role))
+        {
+            std::ostringstream locationHead;
+            locationHead << token
+                << kFieldSeparator << location.role
+                << kFieldSeparator << location.kind
+                << kFieldSeparator << location.entry
+                << kFieldSeparator << (location.pctX >= 0.0f ? static_cast<int32>(std::lround(location.pctX * 10.0f)) : -1)
+                << kFieldSeparator << (location.pctY >= 0.0f ? static_cast<int32>(std::lround(location.pctY * 10.0f)) : -1)
+                << kFieldSeparator << (location.sameMap ? 1 : 0)
+                << kFieldSeparator << UrlEncodeField(location.mapName)
+                << kFieldSeparator << UrlEncodeField(location.zoneName)
+                << kFieldSeparator;
+            SendFittedAddonPacket(requester, replyType, "QI_LOC", locationHead.str(), location.name);
+        }
+    }
+
+    std::vector<QuestMatrixMember> const members = CollectQuestMatrixMembers(requester);
+    for (std::size_t index = 0; index < members.size(); ++index)
+    {
+        Player* const member = members[index].player;
+        char const status = GetQuestMatrixStatus(member, quest);
+
+        std::ostringstream memberPayload;
+        memberPayload << token
+            << kFieldSeparator << index
+            << kFieldSeparator << UrlEncodeField(member->GetName())
+            << kFieldSeparator << (members[index].isSelf ? 1 : 0)
+            << kFieldSeparator << status
+            << kFieldSeparator << static_cast<uint32>(member->getClass());
+        SendAddonPacket(requester, replyType, "QI_MEMBER", memberPayload.str());
+
+        // objective progress only exists while the quest is in the log
+        if (status != 'A' && status != 'R' && status != 'F')
+            continue;
+
+        for (QuestObjectiveLine const& line : BuildQuestObjectives(requester, member, quest, true))
+        {
+            std::ostringstream objectiveHead;
+            objectiveHead << token
+                << kFieldSeparator << index
+                << kFieldSeparator << line.type
+                << kFieldSeparator << line.entry
+                << kFieldSeparator << line.have
+                << kFieldSeparator << line.need
+                << kFieldSeparator;
+            SendFittedAddonPacket(requester, replyType, "QI_OBJ", objectiveHead.str(), line.name);
+        }
+    }
+
+    SendAddonPacket(requester, replyType, "QI_END", token);
+}
+
+void SendQuestProgressPackets(Player* requester, ChatMsg replyType, std::string const& token)
+{
+    std::vector<QuestMatrixMember> const members = CollectQuestMatrixMembers(requester);
+
+    SendAddonPacket(requester, replyType, "QP_BEGIN", token + std::string(1, kFieldSeparator) + std::to_string(members.size()));
+
+    for (std::size_t index = 0; index < members.size(); ++index)
+    {
+        Player* const member = members[index].player;
+
+        std::ostringstream memberPayload;
+        memberPayload << token
+            << kFieldSeparator << index
+            << kFieldSeparator << UrlEncodeField(member->GetName())
+            << kFieldSeparator << (members[index].isSelf ? 1 : 0)
+            << kFieldSeparator << static_cast<uint32>(member->getClass());
+        SendAddonPacket(requester, replyType, "QP_MEMBER", memberPayload.str());
+
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const questId = member->GetQuestSlotQuestId(slot);
+            if (!questId)
+                continue;
+
+            QuestStatus const status = member->GetQuestStatus(questId);
+            if (status != QUEST_STATUS_INCOMPLETE && status != QUEST_STATUS_COMPLETE)
+                continue;
+
+            Quest const* const quest = sObjectMgr->GetQuestTemplate(questId);
+            if (!quest)
+                continue;
+
+            std::string objectives;
+            for (QuestObjectiveLine const& line : BuildQuestObjectives(requester, member, quest, false))
+            {
+                if (line.type != 'K')
+                    continue;
+
+                if (!objectives.empty())
+                    objectives.push_back(',');
+
+                objectives += std::to_string(line.entry) + ":" + std::to_string(line.have) + ":" + std::to_string(line.need);
+            }
+
+            if (objectives.empty())
+                continue;
+
+            std::ostringstream head;
+            head << token
+                << kFieldSeparator << index
+                << kFieldSeparator << questId
+                << kFieldSeparator << (status == QUEST_STATUS_COMPLETE ? 1 : 0)
+                << kFieldSeparator << objectives
+                << kFieldSeparator;
+            SendFittedAddonPacket(requester, replyType, "QP_Q", head.str(), GetQuestMatrixTitle(requester, quest));
+        }
+    }
+
+    SendAddonPacket(requester, replyType, "QP_END", token);
+}
+
+// ---- teleport turn-in -----------------------------------------------------
+
+enum class TurnInPhase : uint8
+{
+    GoingThere,
+    AtGiver,
+    GoingBack
+};
+
+struct TurnInJob
+{
+    ObjectGuid requester;
+    ObjectGuid bot;
+    std::string botName;
+    std::string token;
+    ChatMsg replyType = CHAT_MSG_WHISPER;
+    uint32 questId = 0;
+
+    WorldLocation origin;      // where the bot stood before the trip
+    WorldLocation destination; // the quest ender
+    uint32 giverEntry = 0;
+    bool giverIsCreature = true;
+    bool needReturn = false;
+
+    TurnInPhase phase = TurnInPhase::GoingThere;
+    uint32 phaseMs = 0;
+    std::string failure; // empty = fine so far
+};
+
+std::vector<TurnInJob> sTurnInJobs;
+
+uint32 ChooseQuestReward(Player* bot, Quest const* quest)
+{
+    uint32 const count = quest->GetRewChoiceItemsCount();
+    if (count <= 1)
+        return 0;
+
+    uint32 best = 0;
+    float bestScore = -1.0f;
+    for (uint32 i = 0; i < count; ++i)
+    {
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(quest->RewardChoiceItemId[i]);
+        if (!proto)
+            continue;
+
+        // gear the bot can use first (better item level / quality wins), otherwise the most valuable item
+        float score = proto->SellPrice / 10000.0f;
+        if ((proto->Class == ITEM_CLASS_WEAPON || proto->Class == ITEM_CLASS_ARMOR) && bot->CanUseItem(proto) == EQUIP_ERR_OK)
+            score = 1000.0f + proto->ItemLevel + proto->Quality * 10.0f;
+
+        if (score > bestScore)
+        {
+            bestScore = score;
+            best = i;
+        }
+    }
+
+    return best;
+}
+
+WorldObject* FindTurnInGiver(Player* bot, TurnInJob const& job)
+{
+    if (job.giverIsCreature)
+        return bot->FindNearestCreature(job.giverEntry, kTurnInNpcSearchRange, true);
+
+    return bot->FindNearestGameObject(job.giverEntry, kTurnInNpcSearchRange, true);
+}
+
+void FinishTurnIn(TurnInJob const& job)
+{
+    Player* const requester = ObjectAccessor::FindConnectedPlayer(job.requester);
+    if (!requester || !requester->GetSession())
+        return;
+
+    bool const ok = job.failure.empty();
+
+    std::ostringstream payload;
+    payload << UrlEncodeField(job.botName)
+        << kFieldSeparator << job.token
+        << kFieldSeparator << job.questId
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(ok ? "OK" : job.failure);
+    SendAddonPacket(requester, job.replyType, "QUEST_TURNIN_RESULT", payload.str());
+}
+
+// Starts the trip back (or finishes when the bot never left). Returns true when the job is over.
+bool BeginTurnInReturn(TurnInJob& job, Player* bot)
+{
+    if (!job.needReturn)
+        return true;
+
+    WorldLocation target = job.origin;
+
+    // back to where the player is now, unless they are inside an instance the bot cannot follow into
+    Player* const requester = ObjectAccessor::FindConnectedPlayer(job.requester);
+    if (requester && requester->IsInWorld() && requester->IsAlive() && requester->GetMap() &&
+        !requester->GetMap()->IsDungeon() && !requester->GetMap()->IsBattlegroundOrArena())
+    {
+        Position const closePoint = requester->GetRandomPoint(requester->GetPosition(), 3.0f);
+        target = WorldLocation(requester->GetMapId(), closePoint.GetPositionX(), closePoint.GetPositionY(), closePoint.GetPositionZ(), requester->GetOrientation());
+    }
+
+    if (!bot->TeleportTo(target.GetMapId(), target.GetPositionX(), target.GetPositionY(), target.GetPositionZ(), target.GetOrientation()))
+    {
+        if (job.failure.empty())
+            job.failure = "RETURN_FAILED";
+        return true;
+    }
+
+    job.destination = target;
+    job.phase = TurnInPhase::GoingBack;
+    job.phaseMs = 0;
+    return false;
+}
+
+bool HasArrived(Player* bot, WorldLocation const& target)
+{
+    return !bot->IsBeingTeleported() && bot->GetMapId() == target.GetMapId() && bot->GetExactDist(&target) < kTurnInArrivalDistance;
+}
+
+// Returns true when the job is finished and can be dropped.
+bool ProcessTurnInJob(TurnInJob& job, uint32 elapsedMs)
+{
+    Player* const bot = ObjectAccessor::FindConnectedPlayer(job.bot);
+    if (!bot)
+    {
+        if (job.failure.empty())
+            job.failure = "BOT_GONE";
+        return true;
+    }
+
+    job.phaseMs += elapsedMs;
+
+    // keep the bot's own AI quiet so its follow logic does not pull it away mid-trip
+    if (PlayerbotAI* const botAI = GetBotAI(bot))
+        botAI->SetNextCheckDelay(1500);
+
+    switch (job.phase)
+    {
+        case TurnInPhase::GoingThere:
+        {
+            if (HasArrived(bot, job.destination))
+            {
+                job.phase = TurnInPhase::AtGiver;
+                job.phaseMs = 0;
+                return false;
+            }
+
+            if (job.phaseMs > kTurnInTeleportTimeoutMs)
+            {
+                job.failure = "TELEPORT_FAILED";
+                return BeginTurnInReturn(job, bot);
+            }
+
+            return false;
+        }
+
+        case TurnInPhase::AtGiver:
+        {
+            Quest const* const quest = sObjectMgr->GetQuestTemplate(job.questId);
+            if (!quest || bot->GetQuestStatus(job.questId) != QUEST_STATUS_COMPLETE)
+            {
+                job.failure = "NOT_READY";
+                return BeginTurnInReturn(job, bot);
+            }
+
+            WorldObject* const giver = FindTurnInGiver(bot, job);
+            if (!giver)
+            {
+                // the world around the bot may still be loading
+                if (job.phaseMs > kTurnInNpcTimeoutMs)
+                {
+                    job.failure = "NO_NPC";
+                    return BeginTurnInReturn(job, bot);
+                }
+
+                return false;
+            }
+
+            WorldPacket packet(CMSG_QUESTGIVER_CHOOSE_REWARD);
+            packet << giver->GetGUID() << job.questId << ChooseQuestReward(bot, quest);
+            bot->GetSession()->HandleQuestgiverChooseRewardOpcode(packet);
+
+            if (!bot->IsQuestRewarded(job.questId))
+                job.failure = "REWARD_FAILED";
+
+            return BeginTurnInReturn(job, bot);
+        }
+
+        case TurnInPhase::GoingBack:
+        {
+            if (HasArrived(bot, job.destination))
+                return true;
+
+            return job.phaseMs > kTurnInTeleportTimeoutMs;
+        }
+    }
+
+    return true;
+}
+
+void UpdateTurnInJobs(uint32 diff)
+{
+    if (sTurnInJobs.empty())
+        return;
+
+    static uint32 accumulated = 0;
+    accumulated += diff;
+    if (accumulated < kTurnInTickMs)
+        return;
+
+    uint32 const elapsed = accumulated;
+    accumulated = 0;
+
+    for (auto it = sTurnInJobs.begin(); it != sTurnInJobs.end();)
+    {
+        if (ProcessTurnInJob(*it, elapsed))
+        {
+            FinishTurnIn(*it);
+            it = sTurnInJobs.erase(it);
+        }
+        else
+            ++it;
+    }
+}
+
+void SendTurnInResult(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& token, uint32 questId, std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << UrlEncodeField(botName)
+        << kFieldSeparator << token
+        << kFieldSeparator << questId
+        << kFieldSeparator << "ERR"
+        << kFieldSeparator << UrlEncodeField(reason);
+    SendAddonPacket(requester, replyType, "QUEST_TURNIN_RESULT", payload.str());
+}
+
+void RunQuestTurnInCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& questIdValue)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+
+    uint32 questId = 0;
+    TryParseUint32Field(Trim(questIdValue), 1, std::numeric_limits<uint32>::max(), questId);
+
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    auto fail = [&](std::string const& reason)
+    {
+        SendTurnInResult(requester, replyType, effectiveBotName, token, questId, reason);
+    };
+
+    if (!ConsumeItemActionRateLimit(requester))
+        return fail("RATE_LIMIT");
+    if (!bot)
+        return fail("NO_BOT");
+    if (!questId)
+        return fail("BAD_REQUEST");
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() || !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        return fail("FORBIDDEN");
+
+    Quest const* const quest = sObjectMgr->GetQuestTemplate(questId);
+    if (!quest)
+        return fail("NO_QUEST");
+    if (bot->IsQuestRewarded(questId))
+        return fail("ALREADY_DONE");
+    if (bot->GetQuestStatus(questId) != QUEST_STATUS_COMPLETE)
+        return fail("NOT_READY");
+    if (!bot->IsAlive())
+        return fail("DEAD");
+    if (bot->IsInCombat())
+        return fail("IN_COMBAT");
+    if (bot->IsBeingTeleported())
+        return fail("BUSY");
+    if (!bot->GetMap() || bot->GetMap()->IsDungeon() || bot->GetMap()->IsBattlegroundOrArena())
+        return fail("IN_INSTANCE");
+
+    for (TurnInJob const& existing : sTurnInJobs)
+        if (existing.bot == bot->GetGUID())
+            return fail("BUSY");
+
+    // pick the quest ender: same map and closest first, and only on the open continents
+    std::vector<QuestLocation> const enders = FindQuestLocations(bot, questId, 'E');
+    QuestLocation const* chosen = nullptr;
+    for (QuestLocation const& candidate : enders)
+    {
+        MapEntry const* mapEntry = sMapStore.LookupEntry(candidate.map);
+        if (mapEntry && mapEntry->IsContinent())
+        {
+            chosen = &candidate;
+            break;
+        }
+    }
+
+    if (!chosen)
+        return fail("NO_ENDER");
+
+    TurnInJob job;
+    job.requester = requester->GetGUID();
+    job.bot = bot->GetGUID();
+    job.botName = effectiveBotName;
+    job.token = token;
+    job.replyType = replyType;
+    job.questId = questId;
+    job.origin = WorldLocation(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), bot->GetOrientation());
+    job.destination = WorldLocation(chosen->map, chosen->x, chosen->y, chosen->z, 0.0f);
+    job.giverEntry = chosen->entry;
+    job.giverIsCreature = chosen->kind == 'C';
+
+    bool const alreadyThere = bot->GetMapId() == chosen->map && bot->GetExactDist(chosen->x, chosen->y, chosen->z) < kTurnInArrivalDistance;
+    if (alreadyThere)
+    {
+        // standing next to the giver already: no trip needed
+        job.phase = TurnInPhase::AtGiver;
+        job.needReturn = false;
+    }
+    else
+    {
+        if (!bot->TeleportTo(chosen->map, chosen->x, chosen->y, chosen->z, 0.0f))
+            return fail("TELEPORT_FAILED");
+
+        job.phase = TurnInPhase::GoingThere;
+        job.needReturn = true;
+    }
+
+    sTurnInJobs.push_back(std::move(job));
+}
+
 bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& opcode, std::string const& payload)
 {
     std::string const trimmedOpcode = Trim(opcode);
@@ -7105,7 +8032,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             player,
             replyType,
             "CAPS",
-            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryBulkSellCapability + "," + kInventoryOpenCapability + "," + kGroupRollCapability + "," + kEnchantTradeCapability + "," + kQuestMatrixCapability);
+            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryBulkSellCapability + "," + kInventoryOpenCapability + "," + kGroupRollCapability + "," + kEnchantTradeCapability + "," + kQuestMatrixCapability + "," + kQuestInfoCapability);
         return true;
     }
 
@@ -7283,6 +8210,42 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
 
             SendQuestPackets(player, replyType, fields[1], fields[2], fields[3]);
+            return true;
+        }
+
+        if (requestType == "QUEST_INFO")
+        {
+            std::string const token = GetSafeErrorToken(fields, 1);
+            if (fields.size() != 3)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            if (!IsValidRequestToken(fields[1]))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            uint32 questId = 0;
+            if (!TryParseUint32Field(fields[2], 1, std::numeric_limits<uint32>::max(), questId))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+
+            if (!ConsumeRequestRateLimit("qinfo", player, kQuestInfoRateWindow))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "RATE_LIMIT");
+
+            SendQuestInfoPackets(player, replyType, fields[1], questId);
+            return true;
+        }
+
+        if (requestType == "QUEST_PROGRESS")
+        {
+            std::string const token = GetSafeErrorToken(fields, 1);
+            if (fields.size() != 2)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            if (!IsValidRequestToken(fields[1]))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            if (!ConsumeRequestRateLimit("qprog", player, kQuestProgressRateWindow))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "RATE_LIMIT");
+
+            SendQuestProgressPackets(player, replyType, fields[1]);
             return true;
         }
 
@@ -7588,6 +8551,26 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         return true;
     }
 
+    if (requestType == "QUEST_TURNIN")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 4)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+        if (!IsValidRequestToken(fields[2]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        uint32 questId = 0;
+        if (!TryParseUint32Field(fields[3], 1, std::numeric_limits<uint32>::max(), questId))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+
+        RunQuestTurnInCommand(player, replyType, fields[1], fields[2], fields[3]);
+        return true;
+    }
+
     if (requestType == "QUEST_GIVE")
     {
         std::string const token = GetSafeErrorToken(fields, 2);
@@ -7715,6 +8698,17 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
     return SendProtocolError(player, replyType, normalized, requestType, "", "UNKNOWN_RUN");
 }
 
+class MultiBotBridgeWorldScript final : public WorldScript
+{
+public:
+    MultiBotBridgeWorldScript() : WorldScript("MultiBotBridgeWorldScript", { WORLDHOOK_ON_UPDATE }) {}
+
+    void OnUpdate(uint32 diff) override
+    {
+        UpdateTurnInJobs(diff);
+    }
+};
+
 class MultiBotBridgePlayerScript final : public PlayerScript
 {
 public:
@@ -7792,5 +8786,6 @@ void AddSC_multibot_bridge()
 {
     if (BridgeConsoleLogsEnabled())
         LOG_INFO("server.loading", "mod-multibot-bridge loaded");
+    new MultiBotBridgeWorldScript();
     new MultiBotBridgePlayerScript();
 }

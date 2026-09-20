@@ -231,12 +231,23 @@ local function fillCell(cell, row, j, member)
   cell.text:SetText(text)
   cell.text:SetTextColor(r, g, b)
 
-  local clickable = (st == "N" and not member.isSelf and not (row.pending and row.pending[j]))
+  -- Add (bot does not have it) and Turn in (objectives done) are both clickable for bots, never for your own column
+  local action = nil
+  if not member.isSelf and not (row.pending and row.pending[j]) then
+    if st == "N" then action = "give" elseif st == "R" then action = "turnin" end
+  end
+  local clickable = action ~= nil
   cell.clickable = clickable
+  cell.action = action
   if clickable then
     cell:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8", edgeFile = "Interface\\Buttons\\WHITE8X8", edgeSize = 1 })
-    cell:SetBackdropColor(0.30, 0.16, 0.03, 0.9)
-    cell:SetBackdropBorderColor(1, 0.55, 0.1, 1)
+    if action == "turnin" then
+      cell:SetBackdropColor(0.04, 0.24, 0.05, 0.9)
+      cell:SetBackdropBorderColor(0.25, 1, 0.25, 1)
+    else
+      cell:SetBackdropColor(0.30, 0.16, 0.03, 0.9)
+      cell:SetBackdropBorderColor(1, 0.55, 0.1, 1)
+    end
   else
     cell:SetBackdrop(nil)
   end
@@ -312,6 +323,7 @@ local function showRowTooltip(owner, row)
     end
   end
   GameTooltip:AddLine(" ")
+  GameTooltip:AddLine(tr("Click: quest text, where to go, party progress", "Klick: Quest-Text, Wo, Fortschritt der Party"), 0.5, 0.8, 1)
   GameTooltip:AddLine(tr("Shift-click: link the quest in chat", "Shift-Klick: Quest in den Chat verlinken"), 0.5, 0.5, 0.5)
   GameTooltip:Show()
 end
@@ -362,6 +374,88 @@ function QM.GiveToAll(row)
   end
 end
 
+local TURNIN_TIMEOUT = 75  -- the trip can take: teleport there, look for the NPC, hand in, teleport back
+
+local TURNIN_ERRORS = {
+  NOT_READY = tr("objectives are not done yet", "Ziele noch nicht erfuellt"),
+  ALREADY_DONE = tr("already handed in", "schon abgegeben"),
+  DEAD = tr("the bot is dead", "der Bot ist tot"),
+  IN_COMBAT = tr("the bot is in combat", "der Bot kaempft gerade"),
+  BUSY = tr("the bot is busy (already on a trip or teleporting)", "der Bot ist beschaeftigt (schon unterwegs oder im Teleport)"),
+  IN_INSTANCE = tr("the bot is in an instance/battleground", "der Bot ist in einer Instanz/einem Schlachtfeld"),
+  NO_ENDER = tr("no quest giver with a known position on the open world", "kein Questgeber mit bekannter Position in der offenen Welt"),
+  TELEPORT_FAILED = tr("the teleport did not work", "der Teleport hat nicht funktioniert"),
+  NO_NPC = tr("the quest giver was not there", "der Questgeber war nicht da"),
+  REWARD_FAILED = tr("the reward could not be taken (bags full?)", "die Belohnung konnte nicht abgeholt werden (Taschen voll?)"),
+  RETURN_FAILED = tr("the way back failed - the bot may still be at the quest giver", "der Rueckweg hat nicht geklappt - der Bot steht evtl. noch beim Questgeber"),
+  BOT_GONE = tr("the bot logged out", "der Bot hat sich ausgeloggt"),
+  RATE_LIMIT = tr("too fast, wait a moment", "zu schnell, kurz warten"),
+  FORBIDDEN = tr("not allowed", "keine Berechtigung"),
+  NO_BOT = tr("bot not found", "Bot nicht gefunden"),
+  NO_QUEST = tr("unknown quest", "unbekannte Quest"),
+  BAD_REQUEST = tr("bad request", "ungueltige Anfrage"),
+}
+
+function QM.TurnIn(row, index)
+  local member = QM.data.members[index]
+  if not row or not member or member.isSelf then return end
+
+  local ok, why = bridgeReady()
+  if not ok then
+    say(why or "?")
+    return
+  end
+
+  local token = newToken("t")
+  QM.giveActive[token] = { row = row, index = index, name = member.name, turnin = true }
+  row.pending = row.pending or {}
+  row.pending[index] = true
+
+  if not MultiBot.Comm.Send("RUN", "QUEST_TURNIN~" .. member.name .. "~" .. token .. "~" .. row.id) then
+    QM.giveActive[token] = nil
+    row.pending[index] = nil
+    return
+  end
+
+  say(string.format(tr("%s is going to the quest giver of '%s' ...", "%s geht zum Questgeber von '%s' ..."), member.name, row.title))
+
+  after(TURNIN_TIMEOUT, function()
+    if QM.giveActive[token] then
+      QM.giveActive[token] = nil
+      row.pending[index] = nil
+      updateRows()
+    end
+  end)
+
+  updateRows()
+end
+
+local function onTurnInResult(payload)
+  local name, token, questId, result, reason = strsplit("~", payload or "", 5)
+  local job = QM.giveActive[token or ""]
+  if not job then return end
+  QM.giveActive[token] = nil
+
+  local row = job.row
+  row.pending[job.index] = nil
+  name = decode(name)
+  reason = decode(reason)
+
+  if result == "OK" then
+    row.st[job.index] = "D"
+    say(string.format(tr("%s handed in: %s", "%s hat abgegeben: %s"), name, row.title))
+    after(1.0, function() if frame and frame:IsShown() then QM.Request() end end)
+  else
+    say(string.format(tr("%s could not hand in '%s': %s", "%s konnte '%s' nicht abgeben: %s"), name, row.title, TURNIN_ERRORS[reason] or reason))
+    -- open the quest popup: it shows where the quest is handed in, in case you have to walk there yourself
+    if MultiBot.QuestInfo and MultiBot.QuestInfo.Show then
+      MultiBot.QuestInfo.Show(row.id, row.level)
+    end
+  end
+
+  updateRows()
+end
+
 local function onGiveResult(payload)
   local name, token, questId, result, reason = strsplit("~", payload or "", 5)
   local job = QM.giveActive[token or ""]
@@ -389,6 +483,11 @@ end
 function QM.OnPacket(opcode, payload)
   if opcode == "QUEST_GIVE_RESULT" then
     onGiveResult(payload)
+    return
+  end
+
+  if opcode == "QUEST_TURNIN_RESULT" then
+    onTurnInResult(payload)
     return
   end
 
@@ -472,7 +571,7 @@ function QM.OnError(requestType, token, reason)
     end
 
     setStatusLine("|cffff5555" .. (reason or "error") .. "|r")
-  elseif requestType == "QUEST_GIVE" then
+  elseif requestType == "QUEST_GIVE" or requestType == "QUEST_TURNIN" then
     local job = QM.giveActive[token or ""]
     if job then
       QM.giveActive[token] = nil
@@ -543,8 +642,11 @@ local function createRow(i)
   name:SetScript("OnEnter", function(self) showRowTooltip(self, rf.row) end)
   name:SetScript("OnLeave", function() GameTooltip:Hide() end)
   name:SetScript("OnClick", function()
-    if rf.row and IsShiftKeyDown() and ChatEdit_InsertLink then
+    if not rf.row then return end
+    if IsShiftKeyDown() and ChatEdit_InsertLink then
       ChatEdit_InsertLink(questLink(rf.row))
+    elseif MultiBot.QuestInfo and MultiBot.QuestInfo.Show then
+      MultiBot.QuestInfo.Show(rf.row.id, rf.row.level)
     end
   end)
   rf.name = name
@@ -559,7 +661,12 @@ local function createRow(i)
     cell.text:SetJustifyH("CENTER")
     cell:RegisterForClicks("LeftButtonUp")
     cell:SetScript("OnClick", function(self)
-      if self.clickable and self.row then QM.Give(self.row, self.index) end
+      if not (self.clickable and self.row) then return end
+      if self.action == "turnin" then
+        QM.TurnIn(self.row, self.index)
+      else
+        QM.Give(self.row, self.index)
+      end
     end)
     cell:SetScript("OnEnter", function(self)
       if not self.row then return end
@@ -569,7 +676,12 @@ local function createRow(i)
       GameTooltip:AddLine(m and m.name or "?", 1, 0.82, 0)
       GameTooltip:AddLine(self.row.title, 1, 1, 1)
       local text = STATUS_TIP[st] or st or ""
-      if self.clickable then text = tr("Click: give this quest to the bot", "Klick: Quest direkt an den Bot geben") end
+      if self.action == "give" then
+        text = tr("Click: give this quest to the bot", "Klick: Quest direkt an den Bot geben")
+      elseif self.action == "turnin" then
+        text = tr("Click: the bot teleports to the quest giver, hands the quest in and comes back to you",
+                  "Klick: der Bot teleportiert zum Questgeber, gibt die Quest ab und kommt zu dir zurueck")
+      end
       GameTooltip:AddLine(text, 0.8, 0.8, 0.8)
       GameTooltip:Show()
     end)

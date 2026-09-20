@@ -609,6 +609,46 @@ menu). `client/install_quest_matrix.py` copies it into the addon and applies the
 (`Core/MultiBotComm.lua`, `UI/MultiBotQuestsMenu.lua`, `MultiBot.toc`); it is idempotent, so re-run it after every
 MultiBot update. Restart the WoW client afterwards.
 
+## Quest popup, mouseover progress and turn-in (`QUEST_INFO`, `QUEST_PROGRESS`, `QUEST_TURNIN`)
+
+Capability `QUEST_INFO_V1`. Same reason as the matrix: the client only knows its own quest log, and the texts of quests
+you do not have are not available to addons.
+
+```
+GET QUEST_INFO~<token>~<questId>          one request per 0.4 s per player
+  QI_HEAD    <token>~<questId>~<level>~<minLevel>~<title>
+  QI_TEXT    <token>~<kind>~<index>~<count>~<chunk>        kind D details, O objectives, P progress text, R reward text
+  QI_LOC     <token>~<role S|E>~<kind C|G>~<entry>~<pctX*10>~<pctY*10>~<sameMap>~<map>~<zone>~<name>
+  QI_MEMBER  <token>~<index>~<name>~<self>~<status>~<class>
+  QI_OBJ     <token>~<memberIndex>~<K|G|I>~<entry>~<have>~<need>~<name>
+  QI_END     <token>
+
+GET QUEST_PROGRESS~<token>                one request per 1.5 s per player
+  QP_BEGIN <token>~<members>   QP_MEMBER <token>~<index>~<name>~<self>~<class>
+  QP_Q     <token>~<memberIndex>~<questId>~<complete>~<entry:have:need,...>~<title>     kill objectives only
+  QP_END   <token>
+
+RUN QUEST_TURNIN~<bot>~<token>~<questId>
+  QUEST_TURNIN_RESULT  <bot>~<token>~<questId>~OK|ERR~<reason>          asynchronous, sent when the bot is back
+```
+
+- Quest texts are expanded for the requester (`$n` name, `$r` race, `$c` class, `$b` break, `$g<male>:<female>;`) and split into
+  packets of at most 150 encoded bytes, never inside a UTF-8 character.
+- `QI_LOC` finds the quest starters and enders in `creature_questender/queststarter` and `gameobject_*` and picks the closest
+  spawn on the requester's map. `pctX/pctY` are the world-map percent coordinates (the core's `Map2ZoneCoordinates`, checked
+  against Questie: Marshal McBride 48.92 / 41.61); `-1` on maps that are not open continents.
+- `QUEST_TURNIN` runs as a small state machine driven by a `WorldScript::OnUpdate` tick (250 ms): teleport the bot to the
+  ender, wait for it to arrive, find the NPC/object, hand in via the normal `CMSG_QUESTGIVER_CHOOSE_REWARD` path (reward choice:
+  usable gear first, otherwise the most valuable item), then teleport back next to the requester (or to where the bot came from
+  if the requester is inside an instance). The bot's own AI is held with `SetNextCheckDelay` during the trip. A bot that is
+  already next to the giver is not teleported. Refused with a reason when the bot is dead, in combat, in an instance or
+  battleground, already on a trip, or the quest is not complete. Errors: `NOT_READY ALREADY_DONE DEAD IN_COMBAT BUSY IN_INSTANCE
+  NO_ENDER TELEPORT_FAILED NO_NPC REWARD_FAILED RETURN_FAILED BOT_GONE RATE_LIMIT FORBIDDEN NO_BOT NO_QUEST BAD_REQUEST`.
+
+Client side: `client/MultiBotQuestInfo.lua` (popup, tooltip hook, quest-link click) next to the matrix panel. Both are installed by
+`client/install_quest_matrix.py`, which also removes the AzerothAdmin habit of turning a plain click on a quest link into
+`.quest add <id>:<level>`.
+
 # Chatless Design
 
 This module is designed to reduce automatic chat spam caused by UI refresh operations.
