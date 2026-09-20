@@ -89,6 +89,7 @@ char const* const kInventoryBulkSellCapability = "INVENTORY_BULK_SELL_V1";
 char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
 char const* const kGroupRollCapability = "GROUP_ROLL_V1";
 char const* const kEnchantTradeCapability = "ENCHANT_TRADE_V1";
+char const* const kQuestMatrixCapability = "QUEST_MATRIX_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 
 enum class BridgePayloadStatus
@@ -6751,6 +6752,339 @@ void SendStatsPackets(Player* player, ChatMsg replyType)
     }
 }
 
+// ---------------------------------------------------------------------------
+// QUEST_MATRIX / QUEST_GIVE -- party-wide quest overview and "give this quest to a bot".
+//
+// GET QUEST_MATRIX~<token>~<span>
+//   Rows = union of every party member's active + rewarded quests, filtered to quests whose level is
+//   >= (requester level - span). Columns = requester + the bots grouped with them. One status char
+//   per member and row:
+//     A active (objectives open)   R ready to turn in   F failed   D done (rewarded)
+//     N not taken, could take it   X cannot take it (level / class / prerequisite / ...)
+//   Replies: QM_BEGIN, QM_MEMBER (per column), QM_ROW (per quest), QM_END.
+//
+// RUN QUEST_GIVE~<bot>~<token>~<questId>
+//   Puts the quest straight into the bot's log (same call as the GM ".quest add"), no NPC visit needed.
+//   Reply: QUEST_GIVE_RESULT.
+// ---------------------------------------------------------------------------
+
+std::size_t constexpr kMaxQuestMatrixMembers = 10;
+std::size_t constexpr kMaxQuestMatrixRows = 250;
+uint32 constexpr kDefaultQuestMatrixSpan = 10;
+uint32 constexpr kMaxQuestMatrixSpan = 80;
+std::chrono::milliseconds constexpr kQuestMatrixRateWindow(1500);
+
+struct QuestMatrixMember
+{
+    Player* player = nullptr;
+    bool isSelf = false;
+};
+
+struct QuestMatrixRow
+{
+    uint32 questId = 0;
+    int32 level = 0;
+    uint32 rank = 2; // 0 = someone has it open, 1 = a bot could take it, 2 = nothing to do
+    std::string statuses;
+    std::string title;
+};
+
+bool ConsumeQuestMatrixRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    static std::map<std::string, std::chrono::steady_clock::time_point> lastRequests;
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+
+    auto const existing = lastRequests.find(key);
+    if (existing != lastRequests.end() && now - existing->second < kQuestMatrixRateWindow)
+        return false;
+
+    lastRequests[key] = now;
+
+    if (lastRequests.size() > 512)
+    {
+        for (auto it = lastRequests.begin(); it != lastRequests.end();)
+        {
+            if (it->first != key && now - it->second >= std::chrono::seconds(60))
+                it = lastRequests.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
+// Requester first, then the bots of their group (or, without a group, the bots they master).
+std::vector<QuestMatrixMember> CollectQuestMatrixMembers(Player* requester)
+{
+    std::vector<QuestMatrixMember> members;
+    members.push_back({ requester, true });
+
+    Group* const group = requester->GetGroup();
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+    {
+        if (members.size() >= kMaxQuestMatrixMembers)
+            break;
+
+        if (!bot || bot == requester || !bot->IsInWorld())
+            continue;
+
+        bool const inGroup = group && bot->GetGroup() == group;
+        if (!inGroup && (group || !IsBotMasteredByRequester(requester, bot)))
+            continue;
+
+        members.push_back({ bot, false });
+    }
+
+    return members;
+}
+
+char GetQuestMatrixStatus(Player* member, Quest const* quest)
+{
+    uint32 const questId = quest->GetQuestId();
+    if (member->IsQuestRewarded(questId))
+        return 'D';
+
+    switch (member->GetQuestStatus(questId))
+    {
+        case QUEST_STATUS_COMPLETE:
+            return 'R';
+        case QUEST_STATUS_INCOMPLETE:
+            return 'A';
+        case QUEST_STATUS_FAILED:
+            return 'F';
+        default:
+            break;
+    }
+
+    return member->CanTakeQuest(quest, false) ? 'N' : 'X';
+}
+
+std::string GetQuestMatrixTitle(Player* requester, Quest const* quest)
+{
+    std::string title = quest->GetTitle();
+    if (requester->GetSession())
+        if (QuestLocale const* locale = sObjectMgr->GetQuestLocale(quest->GetQuestId()))
+            ObjectMgr::GetLocaleString(locale->Title, requester->GetSession()->GetSessionDbLocaleIndex(), title);
+
+    return title;
+}
+
+// Drop the last UTF-8 character (not just the last byte, so a multi-byte char is never cut in half).
+void PopLastUtf8Char(std::string& value)
+{
+    while (!value.empty() && (static_cast<unsigned char>(value.back()) & 0xC0) == 0x80)
+        value.pop_back();
+
+    if (!value.empty())
+        value.pop_back();
+}
+
+void SendQuestMatrixPackets(Player* requester, ChatMsg replyType, std::string const& token, uint32 span)
+{
+    std::vector<QuestMatrixMember> const members = CollectQuestMatrixMembers(requester);
+
+    int32 const refLevel = static_cast<int32>(requester->GetLevel());
+    int32 const minLevel = refLevel - static_cast<int32>(span);
+
+    // Union of everything anybody in the party has open or has finished.
+    std::set<uint32> questIds;
+    for (QuestMatrixMember const& member : members)
+    {
+        for (uint32 const questId : member.player->GetActiveQuestIds())
+            questIds.insert(questId);
+
+        for (uint32 const questId : member.player->getRewardedQuests())
+            questIds.insert(questId);
+    }
+
+    std::vector<QuestMatrixRow> rows;
+    for (uint32 const questId : questIds)
+    {
+        Quest const* const quest = sObjectMgr->GetQuestTemplate(questId);
+        if (!quest || quest->GetTitle().empty())
+            continue;
+
+        // Level -1 means "scales with the player": always in range.
+        int32 const questLevel = quest->GetQuestLevel();
+        if (questLevel > 0 && questLevel < minLevel)
+            continue;
+
+        QuestMatrixRow row;
+        row.questId = questId;
+        row.level = questLevel > 0 ? questLevel : refLevel;
+        row.title = GetQuestMatrixTitle(requester, quest);
+
+        bool anyOpen = false;
+        bool botCouldTake = false;
+        for (QuestMatrixMember const& member : members)
+        {
+            char const status = GetQuestMatrixStatus(member.player, quest);
+            row.statuses.push_back(status);
+
+            if (status == 'A' || status == 'R' || status == 'F')
+                anyOpen = true;
+            else if (status == 'N' && !member.isSelf)
+                botCouldTake = true;
+        }
+
+        row.rank = anyOpen ? 0u : (botCouldTake ? 1u : 2u);
+        rows.push_back(std::move(row));
+    }
+
+    // Things you can act on first, then highest quest level first.
+    std::sort(rows.begin(), rows.end(), [](QuestMatrixRow const& left, QuestMatrixRow const& right)
+    {
+        if (left.rank != right.rank)
+            return left.rank < right.rank;
+        if (left.level != right.level)
+            return left.level > right.level;
+        return left.questId < right.questId;
+    });
+
+    bool const truncated = rows.size() > kMaxQuestMatrixRows;
+    if (truncated)
+        rows.resize(kMaxQuestMatrixRows);
+
+    std::ostringstream begin;
+    begin << token
+        << kFieldSeparator << members.size()
+        << kFieldSeparator << rows.size()
+        << kFieldSeparator << refLevel
+        << kFieldSeparator << span
+        << kFieldSeparator << (truncated ? 1 : 0);
+    SendAddonPacket(requester, replyType, "QM_BEGIN", begin.str());
+
+    for (std::size_t index = 0; index < members.size(); ++index)
+    {
+        Player* const member = members[index].player;
+
+        std::ostringstream payload;
+        payload << token
+            << kFieldSeparator << index
+            << kFieldSeparator << UrlEncodeField(member->GetName())
+            << kFieldSeparator << (members[index].isSelf ? 1 : 0)
+            << kFieldSeparator << static_cast<uint32>(member->GetLevel())
+            << kFieldSeparator << static_cast<uint32>(member->getClass());
+        SendAddonPacket(requester, replyType, "QM_MEMBER", payload.str());
+    }
+
+    for (QuestMatrixRow const& row : rows)
+    {
+        std::string const head = token
+            + std::string(1, kFieldSeparator) + std::to_string(row.questId)
+            + std::string(1, kFieldSeparator) + std::to_string(row.level)
+            + std::string(1, kFieldSeparator) + row.statuses
+            + std::string(1, kFieldSeparator);
+
+        // The wire budget is 255 bytes: shorten the title until the whole packet fits.
+        std::string title = row.title;
+        while (!title.empty() && !IsAddonPacketWithinBudget("QM_ROW", head + UrlEncodeField(title)))
+            PopLastUtf8Char(title);
+
+        SendAddonPacket(requester, replyType, "QM_ROW", head + UrlEncodeField(title));
+    }
+
+    SendAddonPacket(requester, replyType, "QM_END", token + std::string(1, kFieldSeparator) + std::to_string(rows.size()));
+}
+
+// Empty string = the bot may take the quest; otherwise a short reason code the addon shows.
+std::string GetQuestGiveBlockReason(Player* bot, Quest const* quest)
+{
+    if (!bot->SatisfyQuestLevel(quest, false))
+        return "LEVEL";
+    if (!bot->SatisfyQuestClass(quest, false))
+        return "CLASS";
+    if (!bot->SatisfyQuestRace(quest, false))
+        return "RACE";
+    if (!bot->SatisfyQuestSkill(quest, false))
+        return "SKILL";
+    if (!bot->SatisfyQuestReputation(quest, false))
+        return "REPUTATION";
+    if (!bot->SatisfyQuestPreviousQuest(quest, false))
+        return "PREREQ";
+    if (!bot->SatisfyQuestExclusiveGroup(quest, false))
+        return "EXCLUSIVE";
+    if (!bot->SatisfyQuestNextChain(quest, false))
+        return "CHAIN";
+    if (!bot->CanTakeQuest(quest, false))
+        return "CANNOT_TAKE";
+    if (!bot->CanAddQuest(quest, false))
+        return "CANNOT_ADD";
+
+    return "";
+}
+
+void RunQuestGiveCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& questIdValue)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+
+    uint32 questId = 0;
+    TryParseUint32Field(Trim(questIdValue), 1, std::numeric_limits<uint32>::max(), questId);
+
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    std::string reason;
+    bool ok = false;
+
+    if (!ConsumeItemActionRateLimit(requester))
+    {
+        reason = "RATE_LIMIT";
+    }
+    else if (!bot)
+    {
+        reason = "NO_BOT";
+    }
+    else if (!questId)
+    {
+        reason = "BAD_REQUEST";
+    }
+    else
+    {
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        Quest const* const quest = sObjectMgr->GetQuestTemplate(questId);
+
+        if (!botAI || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+            reason = "FORBIDDEN";
+        else if (!quest)
+            reason = "NO_QUEST";
+        else if (bot->IsQuestRewarded(questId))
+            reason = "ALREADY_DONE";
+        else if (bot->GetQuestStatus(questId) != QUEST_STATUS_NONE)
+            reason = "ALREADY_HAS";
+        else
+        {
+            reason = GetQuestGiveBlockReason(bot, quest);
+            if (reason.empty())
+            {
+                bot->AddQuestAndCheckCompletion(quest, nullptr);
+                ok = bot->GetQuestStatus(questId) != QUEST_STATUS_NONE;
+                if (!ok)
+                    reason = "FAILED";
+            }
+        }
+    }
+
+    if (ok)
+        reason = "OK";
+
+    std::ostringstream payload;
+    payload << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << token
+        << kFieldSeparator << questId
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason);
+
+    SendAddonPacket(requester, replyType, "QUEST_GIVE_RESULT", payload.str());
+}
+
 bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& opcode, std::string const& payload)
 {
     std::string const trimmedOpcode = Trim(opcode);
@@ -6769,7 +7103,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             player,
             replyType,
             "CAPS",
-            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryBulkSellCapability + "," + kInventoryOpenCapability + "," + kGroupRollCapability + "," + kEnchantTradeCapability);
+            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryBulkSellCapability + "," + kInventoryOpenCapability + "," + kGroupRollCapability + "," + kEnchantTradeCapability + "," + kQuestMatrixCapability);
         return true;
     }
 
@@ -6947,6 +7281,26 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
 
             SendQuestPackets(player, replyType, fields[1], fields[2], fields[3]);
+            return true;
+        }
+
+        if (requestType == "QUEST_MATRIX")
+        {
+            std::string const token = GetSafeErrorToken(fields, 1);
+            if (fields.size() != 3)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            if (!IsValidRequestToken(fields[1]))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            uint32 span = kDefaultQuestMatrixSpan;
+            if (!TryParseUint32Field(fields[2], 0, kMaxQuestMatrixSpan, span))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+
+            if (!ConsumeQuestMatrixRateLimit(player))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "RATE_LIMIT");
+
+            SendQuestMatrixPackets(player, replyType, fields[1], span);
             return true;
         }
 
@@ -7229,6 +7583,26 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         }
 
         RunGroupRollCommand(player, replyType, fields[1], fields[2], fields[3]);
+        return true;
+    }
+
+    if (requestType == "QUEST_GIVE")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 4)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+        if (!IsValidRequestToken(fields[2]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        uint32 questId = 0;
+        if (!TryParseUint32Field(fields[3], 1, std::numeric_limits<uint32>::max(), questId))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+
+        RunQuestGiveCommand(player, replyType, fields[1], fields[2], fields[3]);
         return true;
     }
 

@@ -573,6 +573,42 @@ should not be assumed to be generically fragmented by this capability.
 
 ---
 
+# Quest matrix (local extension: `QUEST_MATRIX` / `QUEST_GIVE`)
+
+Not part of the upstream bridge. A party-wide quest overview inside MultiBot: **rows** are all quests that
+anybody in the party has open or has finished (restricted to quests of the last *span* levels, default 10:
+quest level >= your level - span), **columns** are you plus the bots grouped with you. Cells: `Add` (click: the quest
+goes straight into that bot's log, no NPC visit), `Active`, `Turn in`, `Failed`, `Done`, or `-` (cannot take it).
+
+Why the server has to do it: a 3.3.5 client only ever knows its *own* quest log. The logs of the bots never reach
+the addon, so the bridge computes the matrix and streams it.
+
+Capability: `QUEST_MATRIX_V1` (advertised in `CAPS`).
+
+```
+GET QUEST_MATRIX~<token>~<span>          span 0-80, one request per 1.5 s per player
+  QM_BEGIN   <token>~<members>~<rows>~<refLevel>~<span>~<truncated 0|1>
+  QM_MEMBER  <token>~<index>~<name>~<self 0|1>~<level>~<classId>          (index 0 = you)
+  QM_ROW     <token>~<questId>~<level>~<statuses>~<title>                  one status char per member
+  QM_END     <token>~<rows>
+
+RUN QUEST_GIVE~<bot>~<token>~<questId>
+  QUEST_GIVE_RESULT  <bot>~<token>~<questId>~OK|ERR~<reason>
+```
+
+Status chars: `A` active, `R` ready to turn in, `F` failed, `D` done (rewarded), `N` not taken (could take it),
+`X` cannot take it. Rows are sorted "something to do first" (someone has it open, then a bot could take it, then the rest),
+then by quest level, and cut at 250 rows (`truncated = 1`). Error reasons of `QUEST_GIVE`: `LEVEL CLASS RACE SKILL
+REPUTATION PREREQ EXCLUSIVE CHAIN CANNOT_TAKE CANNOT_ADD ALREADY_DONE ALREADY_HAS NO_BOT NO_QUEST FORBIDDEN RATE_LIMIT`.
+`QUEST_GIVE` uses the same call as the GM `.quest add` (`AddQuestAndCheckCompletion(quest, nullptr)`) after the usual
+`CanTakeQuest` / `CanAddQuest` checks and the Playerbots security level check, so nothing is given that the bot could
+not take at an NPC. With the quest-log overflow core patch (`Quests.MaxActive`) a full log is not a blocker.
+
+Client side (in `client/`): `MultiBotQuestMatrixFrame.lua` is the panel (`/mbq`, or the button in the MultiBot quests
+menu). `client/install_quest_matrix.py` copies it into the addon and applies the three small hooks
+(`Core/MultiBotComm.lua`, `UI/MultiBotQuestsMenu.lua`, `MultiBot.toc`); it is idempotent, so re-run it after every
+MultiBot update. Restart the WoW client afterwards.
+
 # Chatless Design
 
 This module is designed to reduce automatic chat spam caused by UI refresh operations.
